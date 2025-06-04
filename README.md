@@ -120,7 +120,7 @@ npx expo start
 ```
 
 ESP32：
-
+```
 - Arduino IDE
 - ESP32 Board package
 - WiFi
@@ -129,6 +129,7 @@ ESP32：
 - Async TCP
 - Adafruit Bus IO
 - Adafruit PWM Servo Driver Library
+```
 ---
 
 ## 🧑‍🏫 Examples
