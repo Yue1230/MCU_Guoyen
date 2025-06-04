@@ -1,0 +1,244 @@
+import React, { useState, useRef, useEffect } from 'react';
+import {
+  View,
+  Text,
+  TouchableOpacity,
+  StyleSheet,
+  Alert,
+  ActivityIndicator,
+  Dimensions
+} from 'react-native';
+import { MaterialIcons } from '@expo/vector-icons';
+import { useRouter } from 'expo-router';
+
+const { width, height } = Dimensions.get('window');
+const ESP_IP = '192.168.0.215';      // <-- 改成你的 ESP8266 STA IP
+// const ESP_IP = '192.168.0.112';    // <-- 改成你的 ESP8266 AP IP
+const WS_URL = `ws://${ESP_IP}:81`;  // WebSocket 透過 port 81
+
+export default function HomePage() {
+  const [isConnecting, setIsConnecting] = useState(false);
+  const [isConnected, setIsConnected] = useState(false);
+  const [carStatus, setCarStatus] = useState({
+    isMoving: false,
+    action: 'stop',
+    battery: 100
+  });
+
+  const router = useRouter();
+  // 用 ref 存放 WebSocket
+  const ws = useRef(null);
+
+  // 點連接按鈕就建立 WS
+  const connectToCar = () => {
+    if (isConnecting || isConnected) return;
+
+    setIsConnecting(true);
+    ws.current = new WebSocket(WS_URL);
+
+    ws.current.onopen = () => {
+      setIsConnected(true);
+      setIsConnecting(false);
+      Alert.alert('連線成功', '已連上 ESP8266');
+    };
+
+    ws.current.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data.type === 'status') {
+          setCarStatus({
+            isMoving: data.isMoving,
+            action:   data.action,
+            battery:  data.battery
+          });
+        }
+      } catch (err) {
+        console.warn('解析 WS 訊息失敗', err);
+      }
+    };
+
+    ws.current.onerror = (err) => {
+      console.error('WS 連線錯誤', err);
+      setIsConnecting(false);
+      Alert.alert('連線錯誤', '無法連接到車子');
+    };
+
+    ws.current.onclose = () => {
+      setIsConnected(false);
+      setIsConnecting(false);
+      Alert.alert('連線中斷', '與車子的連線已關閉');
+    };
+  };
+
+  // 點斷線按鈕就關閉 WS
+  const disconnectFromCar = () => {
+    if (ws.current) {
+      ws.current.close();
+      ws.current = null;
+    }
+  };
+
+  // 導航到控制頁面 - 移除連線限制
+  const goToControl = () => {
+    // 直接導航到控制頁面，不檢查連線狀態
+    router.push('/control');
+  };
+  
+  // 導航到手臂控制頁面
+  const goToArmControl = () => {
+    // 直接導航到手臂控制頁面
+    router.push('/armcontrol');
+  };
+
+  return (
+    <View style={styles.container}>
+      {/* 標題 */}
+      <View style={styles.header}>
+        <Text style={styles.title}>車子遙控器</Text>
+        <Text style={styles.subtitle}>Remote Car Controller</Text>
+      </View>
+
+      {/* 連線狀態 */}
+      <View style={styles.statusContainer}>
+        <MaterialIcons 
+          name={isConnected ? 'wifi' : 'wifi-off'} 
+          size={60} 
+          color={isConnected ? '#4CAF50' : '#757575'} 
+        />
+        <Text style={[styles.statusText, { color: isConnected ? '#4CAF50' : '#757575' }]}>
+          {isConnected ? '已連線到robotcar' : '未連線'}
+        </Text>
+        {isConnected && (
+          <Text style={styles.signalText}>
+            車子狀態：{carStatus.isMoving ? '移動中 ('+carStatus.action+')' : '停止'}，電量 {carStatus.battery}%
+          </Text>
+        )}
+      </View>
+
+      {/* 按鈕區域 */}
+      <View style={styles.buttonContainer}>
+        {/* 連/斷線按鈕 */}
+        <TouchableOpacity
+          style={[styles.wifiButton, isConnected && styles.connectedButton]}
+          onPress={isConnected ? disconnectFromCar : connectToCar}
+          disabled={isConnecting}
+        >
+          {isConnecting ? (
+            <ActivityIndicator color="#FFFFFF" />
+          ) : (
+            <MaterialIcons 
+              name={isConnected ? 'wifi-off' : 'wifi'} 
+              size={24} 
+              color="#FFFFFF" 
+              style={styles.buttonIcon}
+            />
+          )}
+          <Text style={styles.buttonText}>
+            {isConnecting
+              ? '連線中...'
+              : isConnected
+                ? '斷開連線'
+                : '連接車子'}
+          </Text>
+        </TouchableOpacity>
+
+        {/* 控制介面按鈕 */}
+        <TouchableOpacity
+          style={styles.controlButton}
+          onPress={goToControl}
+        >
+          <MaterialIcons 
+            name="gamepad" 
+            size={24} 
+            color="#FFFFFF" 
+            style={styles.buttonIcon}
+          />
+          <Text style={styles.buttonText}>車輪控制</Text>
+        </TouchableOpacity>
+        
+        {/* 手臂控制按鈕 */}
+        <TouchableOpacity
+          style={styles.armControlButton}
+          onPress={goToArmControl}
+        >
+          <MaterialIcons 
+            name="build" 
+            size={24} 
+            color="#FFFFFF" 
+            style={styles.buttonIcon}
+          />
+          <Text style={styles.buttonText}>手臂控制</Text>
+        </TouchableOpacity>
+      </View>
+      
+      {/* 說明 */}
+      <View style={styles.footer}>
+        <Text style={styles.footerText}>
+          請先確定 ESP8266 已連上 "{ESP_IP}"，按「連接車子」建立 WebSocket
+        </Text>
+        <Text style={styles.footerSubText}>
+          可以隨時進入控制介面進行測試和修改
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+const styles = StyleSheet.create({
+  container: { flex: 1, backgroundColor: '#f5f5f5', paddingHorizontal: 20 },
+  header: { alignItems: 'center', marginTop: height * 0.1, marginBottom: 40 },
+  title: { fontSize: 28, fontWeight: 'bold', color: '#333' },
+  subtitle: { fontSize: 16, color: '#666', fontStyle: 'italic' },
+  statusContainer: {
+    alignItems: 'center',
+    padding: 30,
+    backgroundColor: '#FFFFFF',
+    borderRadius: 15,
+    elevation: 3,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.1,
+    shadowRadius: 4,
+    marginBottom: 40
+  },
+  statusText: { fontSize: 20, fontWeight: '600', marginTop: 15 },
+  signalText: { fontSize: 14, color: '#666', marginTop: 8 },
+  buttonContainer: { alignItems: 'center', gap: 20 },
+  wifiButton: {
+    backgroundColor: '#2196F3',
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 15,
+    paddingHorizontal: 30,
+    borderRadius: 10,
+    elevation: 3
+  },
+  connectedButton: { backgroundColor: '#FF5722' },
+  controlButton: {
+    backgroundColor: '#4CAF50',
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 15,
+    paddingHorizontal: 30,
+    borderRadius: 10,
+    elevation: 3
+  },
+  armControlButton: {
+    backgroundColor: '#9C27B0',
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 15,
+    paddingHorizontal: 30,
+    borderRadius: 10,
+    elevation: 3
+  },
+  disabledButton: {
+    backgroundColor: '#BDBDBD',
+    elevation: 1
+  },
+  buttonIcon: { marginRight: 10 },
+  buttonText: { color: '#FFFFFF', fontSize: 18, fontWeight: '600' },
+  footer: { position: 'absolute', bottom: 30, left: 20, right: 20, alignItems: 'center' },
+  footerText: { color: '#666', fontSize: 14, textAlign: 'center', marginBottom: 5 },
+  footerSubText: { color: '#999', fontSize: 12, textAlign: 'center' }
+});

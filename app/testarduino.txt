@@ -1,0 +1,555 @@
+#include <Wire.h>
+#include <Adafruit_PWMServoDriver.h>
+
+// ======== PCA9685設定 ========
+Adafruit_PWMServoDriver pwm = Adafruit_PWMServoDriver();
+
+// 伺服馬達脈衝寬度設定 (可根據您的伺服馬達調整)
+#define SERVOMIN  150 // 最小脈衝寬度計數 (大約1ms)
+#define SERVOMAX  600 // 最大脈衝寬度計數 (大約2ms)
+
+// ======== 機械臂設定 ========
+#define NUM_SERVOS 6
+const int armServoChannels[NUM_SERVOS] = {0, 1, 2, 3, 4, 5}; // PCA9685通道
+int armCurrentPositions[NUM_SERVOS] = {90, 90, 90, 90, 90, 90};
+
+bool isAutoMode = false;
+bool isEmergencyMode = false;
+bool isAnimating = false;
+int currentPhase = 0;
+unsigned long lastAnimationTime = 0;
+int animationStep = 0;
+
+struct {
+  struct {
+    int rotate = 90;
+    int lift = 45;
+    int reach = 60;
+    int gripper = 80;
+    int joint5 = 90;
+    int joint6 = 45;
+  } PICK_POSITION;
+
+  struct {
+    int rotate = 180;
+    int lift = 90;
+    int reach = 120;               
+    int gripper = 20;
+    int joint5 = 45;
+    int joint6 = 90;
+  } TARGET_POSITION;
+
+  struct {
+    int rotate = 90;
+    int lift = 90;
+    int reach = 90;
+    int gripper = 50;
+    int joint5 = 90;
+    int joint6 = 90;
+  } INITIAL_POSITION;
+} POSITION_CONFIGS;
+
+const int ANIMATION_DURATION = 1000;
+const int ANIMATION_DELAY = 500;
+const int GRIP_WAIT_TIME = 1000;
+
+// ======== 車輛驅動設定 ========
+#define A_IN1  22   
+#define A_IN2  23
+#define A_ENA  24
+#define B_IN3  25
+#define B_IN4  26
+#define B_ENB  27
+#define STEERING_SERVO_CHANNEL 6  // PCA9685通道6用於轉向伺服
+#define MOTOR_SPEED 200
+
+#define LED_PIN 53  // Mega2560 內建 LED
+
+int steeringAngle = 90;
+
+String currentAction = "stop";
+bool vehicleEmergencyMode = false;
+int batteryLevel = 100;
+bool isMoving = false;
+
+unsigned long lastStatusReport = 0;
+unsigned long lastBatteryUpdate = 0;
+
+// ======== PCA9685輔助函數 ========
+// 將角度(0-180)轉換為PWM值
+uint16_t angleToPWM(uint8_t angle) {
+  return map(angle, 0, 180, SERVOMIN, SERVOMAX);
+}
+
+// 設定伺服馬達角度
+void setServoAngle(uint8_t channel, uint8_t angle) {
+  if (isEmergencyMode && channel < NUM_SERVOS) return; // 機械臂緊急停止時不動作
+  
+  angle = constrain(angle, 0, 180);
+  uint16_t pwmValue = angleToPWM(angle);
+  pwm.setPWM(channel, 0, pwmValue);
+  
+  // Debug輸出
+  Serial.print("設定通道 ");
+  Serial.print(channel);
+  Serial.print(" 角度: ");
+  Serial.print(angle);
+  Serial.print("° PWM: ");
+  Serial.println(pwmValue);
+}
+
+void setup() {
+  Serial.begin(115200);  // debug
+  Serial1.begin(9600);   // 車輛控制 (ESP32 UART2)
+  Serial2.begin(115200); // 機械臂控制 (ESP32 UART1)
+
+  // PCA9685初始化
+  pwm.begin();
+  pwm.setPWMFreq(60);  // 伺服馬達標準頻率60Hz
+  
+  // 等待PCA9685穩定
+  delay(10);
+
+  // 機械臂伺服初始化
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    armCurrentPositions[i] = POSITION_CONFIGS.INITIAL_POSITION.rotate; // 暫時設為同一值
+    setServoAngle(armServoChannels[i], armCurrentPositions[i]);
+    delay(100); // 讓伺服有時間到位
+  }
+  
+  // 正確設定初始位置
+  armCurrentPositions[0] = POSITION_CONFIGS.INITIAL_POSITION.rotate;
+  armCurrentPositions[1] = POSITION_CONFIGS.INITIAL_POSITION.lift;
+  armCurrentPositions[2] = POSITION_CONFIGS.INITIAL_POSITION.reach;
+  armCurrentPositions[3] = POSITION_CONFIGS.INITIAL_POSITION.gripper;
+  armCurrentPositions[4] = POSITION_CONFIGS.INITIAL_POSITION.joint5;
+  armCurrentPositions[5] = POSITION_CONFIGS.INITIAL_POSITION.joint6;
+
+  // 車輛馬達腳位初始化
+  pinMode(A_IN1, OUTPUT);
+  pinMode(A_IN2, OUTPUT);
+  pinMode(A_ENA, OUTPUT);
+  pinMode(B_IN3, OUTPUT);
+  pinMode(B_IN4, OUTPUT);
+  pinMode(B_ENB, OUTPUT);
+
+  pinMode(LED_PIN, OUTPUT);
+  digitalWrite(LED_PIN, LOW);
+
+  // 轉向伺服初始化
+  setServoAngle(STEERING_SERVO_CHANNEL, steeringAngle);
+
+  driveStop();
+
+  Serial.println("系統啟動: 機械臂與車輛控制 (使用PCA9685)");
+}
+
+void loop() {
+  // 處理機械臂指令 (Serial2)
+  if (Serial2.available() > 0) {
+    String cmd = Serial2.readStringUntil('\n');
+    cmd.trim();
+    handleArmSerialCommand(cmd);
+  }
+
+  // 自動模式控制 (機械臂動畫)
+  if (isAutoMode && !isEmergencyMode) {
+    runAutoMode();
+  }
+  updateServos();
+
+  // 處理車輛指令 (Serial1)
+  if (Serial1.available()) {
+    String cmd = Serial1.readStringUntil('\n');
+    cmd.trim();
+    handleVehicleCommand(cmd);
+  }
+
+  // 車輛狀態回報
+  if (millis() - lastStatusReport > 2000) {
+    sendStatusReport();
+    lastStatusReport = millis();
+  }
+
+  // 電量模擬
+  if (millis() - lastBatteryUpdate > 30000) {
+    if (batteryLevel > 0 && isMoving) {
+      batteryLevel--;
+    }
+    lastBatteryUpdate = millis();
+  }
+
+  delay(10);
+}
+
+// 機械臂指令處理，接收字串
+void handleArmSerialCommand(String command) {
+  if (command.startsWith("rotateArm")) {
+    int value = command.substring(10).toInt();
+    setServoPosition(0, value);
+  }
+  else if (command.startsWith("liftArm")) {
+    int value = command.substring(8).toInt();
+    setServoPosition(1, value);
+  }
+  else if (command.startsWith("reachArm")) {
+    int value = command.substring(9).toInt();
+    setServoPosition(2, value);
+  }
+  else if (command.startsWith("setGripper")) {
+    int value = command.substring(11).toInt();
+    setServoPosition(3, value);
+  }
+  else if (command.startsWith("setJoint5")) {
+    int value = command.substring(10).toInt();
+    setServoPosition(4, value);
+  }
+  else if (command.startsWith("setJoint6")) {
+    int value = command.substring(10).toInt();
+    setServoPosition(5, value);
+  }
+  else if (command == "getArmPosition") {
+    sendCurrentPositions();
+  }
+  else if (command == "startAutoMode") {
+    startAutoMode();
+  }
+  else if (command == "stopAutoMode") {
+    stopAutoMode();
+  }
+  else if (command == "armEmgStop") {
+    emergencyStop();
+  }
+  else if (command == "armResume") {
+    resumeFromEmergency();
+  }
+  else if (command == "resetPosition") {
+    resetToInitialPosition();
+  }
+  else {
+    Serial2.println("UnknownCommand:" + command);
+  }
+  
+  // Debug: 顯示收到的指令
+  Serial.println("ARM指令: " + command);
+}
+
+void setServoPosition(int servoIndex, int value) {
+  if (isEmergencyMode) return;
+  value = constrain(value, 0, 180);
+  armCurrentPositions[servoIndex] = value;
+  // 不管是否在自動模式，都立即執行動作
+  setServoAngle(armServoChannels[servoIndex], value);
+}
+
+void sendCurrentPositions() {
+  Serial2.print("ArmPositions:");
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    Serial2.print(armCurrentPositions[i]);
+    if (i < NUM_SERVOS - 1) Serial2.print(",");
+  }
+  Serial2.println();
+}
+
+void startAutoMode() {
+  if (isEmergencyMode) return;
+  isAutoMode = true;
+  isAnimating = true;
+  currentPhase = 1;
+  animationStep = 0;
+  lastAnimationTime = millis();
+  Serial2.println("AutoMode:1");
+  Serial2.println("Phase:1");
+}
+
+void stopAutoMode() {
+  isAutoMode = false;
+  isAnimating = false;
+  currentPhase = 0;
+  Serial2.println("AutoMode:0");
+  Serial2.println("Phase:0");
+}
+
+void emergencyStop() {
+  isEmergencyMode = true;
+  isAutoMode = false;
+  isAnimating = false;
+  // PCA9685不需要detach，只是停止更新PWM
+  Serial2.println("Emergency:1");
+}
+
+void resumeFromEmergency() {
+  isEmergencyMode = false;
+  // 恢復當前位置
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    setServoAngle(armServoChannels[i], armCurrentPositions[i]);
+  }
+  Serial2.println("Emergency:0");
+}
+
+void resetToInitialPosition() {
+  if (isEmergencyMode || isAutoMode) return;
+  
+  Serial2.println("Starting reset to initial position...");
+  
+  // 直接設定到初始位置
+  armCurrentPositions[0] = POSITION_CONFIGS.INITIAL_POSITION.rotate;
+  armCurrentPositions[1] = POSITION_CONFIGS.INITIAL_POSITION.lift;
+  armCurrentPositions[2] = POSITION_CONFIGS.INITIAL_POSITION.reach;
+  armCurrentPositions[3] = POSITION_CONFIGS.INITIAL_POSITION.gripper;
+  armCurrentPositions[4] = POSITION_CONFIGS.INITIAL_POSITION.joint5;
+  armCurrentPositions[5] = POSITION_CONFIGS.INITIAL_POSITION.joint6;
+  
+  // 同時設定所有伺服到初始位置
+  for (int i = 0; i < NUM_SERVOS; i++) {
+    setServoAngle(armServoChannels[i], armCurrentPositions[i]);
+    delay(50); // 小延遲讓伺服有時間響應
+  }
+  
+  sendCurrentPositions(); // 回傳當前位置給前端
+  Serial2.println("ResetComplete");
+}
+
+void updateServos() {
+  if (!isAnimating) return;
+  unsigned long currentTime = millis();
+  unsigned long elapsed = currentTime - lastAnimationTime;
+
+  switch (currentPhase) {
+    case 1: animateToPickPosition(elapsed); break;
+    case 2: animateGripAction(elapsed); break;
+    case 3: animateToTargetPosition(elapsed); break;
+    case 0: animateResetPosition(elapsed); break;
+  }
+}
+
+// 動畫函數實現
+void runAutoMode() {
+  // 自動模式下的主控制邏輯已在前端實現
+  // 這裡只需要確保伺服馬達響應前端指令
+}
+
+void animateToPickPosition(unsigned long elapsed) {
+  // 平滑移動到拾取位置 - 前端控制動畫，Arduino執行動作
+  if (elapsed > ANIMATION_DURATION) {
+    // 確保到達目標位置
+    armCurrentPositions[0] = POSITION_CONFIGS.PICK_POSITION.rotate;
+    armCurrentPositions[1] = POSITION_CONFIGS.PICK_POSITION.lift;
+    armCurrentPositions[2] = POSITION_CONFIGS.PICK_POSITION.reach;
+    armCurrentPositions[3] = POSITION_CONFIGS.PICK_POSITION.gripper;
+    armCurrentPositions[4] = POSITION_CONFIGS.PICK_POSITION.joint5;
+    armCurrentPositions[5] = POSITION_CONFIGS.PICK_POSITION.joint6;
+    
+    // 同時設定所有伺服到位置
+    for (int i = 0; i < NUM_SERVOS; i++) {
+      setServoAngle(armServoChannels[i], armCurrentPositions[i]);
+    }
+    
+    currentPhase = 2;
+    lastAnimationTime = millis();
+    Serial2.println("Phase:2");
+  }
+}
+
+void animateGripAction(unsigned long elapsed) {
+  // 夾取動作
+  if (elapsed > GRIP_WAIT_TIME) {
+    // 夾爪夾緊
+    armCurrentPositions[3] = 10; // 夾緊
+    setServoAngle(armServoChannels[3], armCurrentPositions[3]);
+    
+    currentPhase = 3;
+    lastAnimationTime = millis();
+    Serial2.println("Phase:3");
+  }
+}
+
+void animateToTargetPosition(unsigned long elapsed) {
+  // 移動到目標位置
+  if (elapsed > ANIMATION_DURATION) {
+    // 設定所有伺服到目標位置
+    armCurrentPositions[0] = POSITION_CONFIGS.TARGET_POSITION.rotate;
+    armCurrentPositions[1] = POSITION_CONFIGS.TARGET_POSITION.lift;
+    armCurrentPositions[2] = POSITION_CONFIGS.TARGET_POSITION.reach;
+    armCurrentPositions[3] = POSITION_CONFIGS.TARGET_POSITION.gripper;
+    armCurrentPositions[4] = POSITION_CONFIGS.TARGET_POSITION.joint5;
+    armCurrentPositions[5] = POSITION_CONFIGS.TARGET_POSITION.joint6;
+    
+    // 同時設定所有伺服到位置
+    for (int i = 0; i < NUM_SERVOS; i++) {
+      setServoAngle(armServoChannels[i], armCurrentPositions[i]);
+    }
+    
+    stopAutoMode();
+    Serial2.println("AutoSequenceComplete");
+  }
+}
+
+void animateResetPosition(unsigned long elapsed) {
+  // 重置到初始位置
+  if (elapsed > ANIMATION_DURATION) {
+    // 設定到正確的初始位置
+    armCurrentPositions[0] = POSITION_CONFIGS.INITIAL_POSITION.rotate;
+    armCurrentPositions[1] = POSITION_CONFIGS.INITIAL_POSITION.lift;
+    armCurrentPositions[2] = POSITION_CONFIGS.INITIAL_POSITION.reach;
+    armCurrentPositions[3] = POSITION_CONFIGS.INITIAL_POSITION.gripper;
+    armCurrentPositions[4] = POSITION_CONFIGS.INITIAL_POSITION.joint5;
+    armCurrentPositions[5] = POSITION_CONFIGS.INITIAL_POSITION.joint6;
+    
+    // 同時設定所有伺服到初始位置
+    for (int i = 0; i < NUM_SERVOS; i++) {
+      setServoAngle(armServoChannels[i], armCurrentPositions[i]);
+    }
+    
+    isAnimating = false;
+    Serial2.println("ResetComplete");
+  }
+}
+
+// 車輛指令處理
+void handleVehicleCommand(String cmd) {
+  Serial.println("收到指令：" + cmd);
+  if (vehicleEmergencyMode && cmd != "RESUME") {
+    Serial.println("緊急停止模式，忽略指令: " + cmd);
+    return;
+  }
+
+  if (cmd == "FORWARD" || cmd == "forward") driveForward();
+  else if (cmd == "BACKWARD" || cmd == "backward") driveBackward();
+  else if (cmd == "STOP" || cmd == "stop") driveStop();
+  else if (cmd == "LEFT" || cmd == "stepLeft") stepLeft();
+  else if (cmd == "RIGHT" || cmd == "stepRight") stepRight();
+  else if (cmd == "EMERGENCY") executeEmergencyStop();
+  else if (cmd == "RESUME") executeResume();
+  else if (cmd == "INIT") executeInit();
+  else Serial.println("未知指令: " + cmd);
+}
+
+void driveForward() {
+  if (vehicleEmergencyMode) return;
+  currentAction = "forward";
+  isMoving = true;
+  digitalWrite(A_IN1, HIGH);
+  digitalWrite(A_IN2, LOW);
+  analogWrite(A_ENA, MOTOR_SPEED);
+  digitalWrite(B_IN3, HIGH);
+  digitalWrite(B_IN4, LOW);
+  analogWrite(B_ENB, MOTOR_SPEED);
+  digitalWrite(LED_PIN, HIGH);
+  Serial.println("執行前進，速度: " + String(MOTOR_SPEED));
+}
+
+void driveBackward() {
+  if (vehicleEmergencyMode) return;
+  currentAction = "backward";
+  isMoving = true;
+  digitalWrite(A_IN1, LOW);
+  digitalWrite(A_IN2, HIGH);
+  analogWrite(A_ENA, MOTOR_SPEED);
+  digitalWrite(B_IN3, LOW);
+  digitalWrite(B_IN4, HIGH);
+  analogWrite(B_ENB, MOTOR_SPEED);
+  digitalWrite(LED_PIN, HIGH);
+  Serial.println("執行後退，速度: " + String(MOTOR_SPEED));
+}
+
+void driveStop() {
+  currentAction = "stop";
+  isMoving = false;
+  digitalWrite(A_IN1, LOW);
+  digitalWrite(A_IN2, LOW);
+  analogWrite(A_ENA, 0);
+  digitalWrite(B_IN3, LOW);
+  digitalWrite(B_IN4, LOW);
+  analogWrite(B_ENB, 0);
+  digitalWrite(LED_PIN, LOW);
+  Serial.println("執行停止");
+}
+
+void stepLeft() {
+  if (vehicleEmergencyMode) return;
+  currentAction = "stepLeft";
+  int newAngle = max(steeringAngle - 10, 0);
+  if (newAngle != steeringAngle) {
+    steeringAngle = newAngle;
+    setServoAngle(STEERING_SERVO_CHANNEL, steeringAngle);
+    Serial.println("左轉，當前角度: " + String(steeringAngle));
+    blinkLED(1, 100);
+  } else {
+    Serial.println("已達最大左轉角度: " + String(steeringAngle));
+  }
+  delay(100);
+  currentAction = "stop";
+}
+
+void stepRight() {
+  if (vehicleEmergencyMode) return;
+  currentAction = "stepRight";
+  int newAngle = min(steeringAngle + 10, 180);
+  if (newAngle != steeringAngle) {
+    steeringAngle = newAngle;
+    setServoAngle(STEERING_SERVO_CHANNEL, steeringAngle);
+    Serial.println("右轉，當前角度: " + String(steeringAngle));
+    blinkLED(2, 100);
+  } else {
+    Serial.println("已達最大右轉角度: " + String(steeringAngle));
+  }
+  delay(100);
+  currentAction = "stop";
+}
+
+void executeEmergencyStop() {
+  vehicleEmergencyMode = true;
+  currentAction = "emgStop";
+  isMoving = false;
+  driveStop();
+  steeringAngle = 90;
+  setServoAngle(STEERING_SERVO_CHANNEL, steeringAngle);
+  Serial.println("緊急停止！所有馬達已停止，轉向回中心");
+  for (int i = 0; i < 10; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(100);
+    digitalWrite(LED_PIN, LOW);
+    delay(100);
+  }
+}
+
+void executeResume() {
+  vehicleEmergencyMode = false;
+  currentAction = "stop";
+  isMoving = false;
+  driveStop();
+  steeringAngle = 90;
+  setServoAngle(STEERING_SERVO_CHANNEL, steeringAngle);
+  Serial.println("恢復控制，系統準備就緒");
+  blinkLED(3, 150);
+}
+
+void executeInit() {
+  vehicleEmergencyMode = false;
+  currentAction = "stop";
+  batteryLevel = 100;
+  isMoving = false;
+  driveStop();
+  steeringAngle = 90;
+  setServoAngle(STEERING_SERVO_CHANNEL, steeringAngle);
+  Serial.println("系統初始化完成");
+  Serial.println("馬達速度: " + String(MOTOR_SPEED));
+  Serial.println("轉向角度: " + String(steeringAngle));
+  blinkLED(2, 300);
+}
+
+void sendStatusReport() {
+  String status = "STATUS:" + currentAction + "," + String(batteryLevel);
+  Serial1.println(status);
+  Serial.println("發送狀態: " + status + " (角度:" + String(steeringAngle) + ")");
+}
+
+void blinkLED(int times, int delayMs) {
+  for (int i = 0; i < times; i++) {
+    digitalWrite(LED_PIN, HIGH);
+    delay(delayMs);
+    digitalWrite(LED_PIN, LOW);
+    delay(delayMs);
+  }
+}
