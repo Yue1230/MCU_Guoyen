@@ -123,9 +123,12 @@ ESP32：
 
 - Arduino IDE
 - ESP32 Board package
-- WiFi.h
-- WebSocketsServer.h
-
+- WiFi
+- ESPAsyncWebserver
+- AduinoJson
+- Async TCP
+- Adafruit Bus IO
+- Adafruit PWM Servo Driver Library
 ---
 
 ## 🧑‍🏫 Examples
