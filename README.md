@@ -158,7 +158,7 @@ ESP32：
 
 ## 👥 Contributors
 
-- 🧑‍💻 Author: ChangYue
+- 🧑‍💻 Author: MCU Group 8 
 - Special thanks to OpenAI GPT Assistance
 
 ---
